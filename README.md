@@ -1,5 +1,5 @@
 # ENCY CAM postprocessors examples
-Examples of postprocessors' source codes for [**ENCY CAM**](https://www.encycam.com).
+Examples of postprocessors' source codes for [**ENCY CAM**](https://encycam.com).
 
 To be possible to build the postprocessors you should install ENCY CAM before, because postprocessors depend on CAM's libraries. 
 You can use download links from [ the official site](https://encycam.com/).
