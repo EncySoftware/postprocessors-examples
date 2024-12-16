@@ -1,30 +1,29 @@
-﻿namespace DotnetPostprocessing.Post
+﻿namespace DotnetPostprocessing.Post;
+
+public partial class Postprocessor : TPostprocessor
 {
+    TTextNCFile nc;
 
-    public partial class Postprocessor: TPostprocessor
+    public override void OnStartProject(ICLDProject prj)
     {
-        TTextNCFile nc;
-
-        public override void OnStartProject(ICLDProject prj)
-        {
-            nc = new TTextNCFile(this);
-            nc.OutputFileName = @"D:\MyProgramsOnDotNet\GCodeText.txt";
-        }
-
-        public override void OnStartTechOperation(ICLDTechOperation op, ICLDPPFunCommand cmd, CLDArray cld)
-        {
-            nc.WriteLine("; " + op.Comment);
-        }
-
-        public override void OnGoto(ICLDGotoCommand cmd, CLDArray cld)
-        {
-            nc.WriteLine("G1 X" + cmd.EP.X + " Y" + cmd.EP.Y + " Z" + cmd.EP.Z);
-        }
-
-        public override void OnCircle(ICLDCircleCommand cmd, CLDArray cld)
-        {
-            nc.WriteLine("G" + cmd.Dir + " X" + cmd.EP.X + " Y" + cmd.EP.Y + " Z" + cmd.EP.Z + " R" + cmd.RIso);
-        }
-
+        nc = new TTextNCFile(this);
+        nc.OutputFileName = @"D:\MyProgramsOnDotNet\GCodeText.txt";
     }
+
+    public override void OnStartTechOperation(ICLDTechOperation op, ICLDPPFunCommand cmd, CLDArray cld)
+    {
+        nc.WriteLine("; " + op.Comment);
+    }
+
+    public override void OnGoto(ICLDGotoCommand cmd, CLDArray cld)
+    {
+        nc.WriteLine("G1 X" + cmd.EP.X + " Y" + cmd.EP.Y + " Z" + cmd.EP.Z);
+    }
+
+    public override void OnCircle(ICLDCircleCommand cmd, CLDArray cld)
+    {
+        nc.WriteLine("G" + cmd.Dir + " X" + cmd.EP.X + " Y" + cmd.EP.Y + " Z" + cmd.EP.Z + " R" + cmd.RIso);
+    }
+
 }
+
