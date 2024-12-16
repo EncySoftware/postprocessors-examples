@@ -1,1022 +1,1124 @@
+namespace DotnetPostprocessing.Post;
+
 using System.Collections;
 
-namespace DotnetPostprocessing.Post
+public partial class NCFile : TTextNCFile
 {
+    ///<summary>Main nc-programm number</summary>
+    public int ProgNumber { get; set; }
 
-    public partial class NCFile: TTextNCFile
+    ///<summary>Last point (X, Y, Z) was written to the nc-file</summary>
+    public TInp3DPoint LastP { get; set; }
+
+    ///<summary>Current plane third coordinate register Z, Y or X</summary>
+    public NumericNCWord PlaneZReg;
+
+    public override void OnInit()
     {
-        ///<summary>Main nc-programm number</summary>
-        public int ProgNumber {get; set;}
-
-        ///<summary>Last point (X, Y, Z) was written to the nc-file</summary>
-        public TInp3DPoint LastP {get; set;}
-
-        ///<summary>Current plane third coordinate register Z, Y or X</summary>
-        public NumericNCWord PlaneZReg;
-
-        public override void OnInit()
-        {
         //     this.TextEncoding = Encoding.GetEncoding("windows-1251");
-        }
+    }
 
-        public void OutWithN(params string[] s) {
-            string outS = "";
-            if (!BlockN.Disabled) {
-                outS = BlockN.ToString(BlockN);
-                BlockN.v = BlockN + 1;
-            }
-            for (int i=0; i<s.Length; i++) {
-                if (!String.IsNullOrEmpty(outS)) 
-                   outS += Block.WordsSeparator;
-                outS += s[i];
-            }
-            WriteLine(outS);
+    public void OutWithN(params string[] s)
+    {
+        string outS = "";
+        if (!BlockN.Disabled)
+        {
+            outS = BlockN.ToString(BlockN);
+            BlockN.v = BlockN + 1;
+        }
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (!String.IsNullOrEmpty(outS))
+                outS += Block.WordsSeparator;
+            outS += s[i];
+        }
+        WriteLine(outS);
+    }
+}
+
+public struct ProbingCycleState
+{
+    int LastComponentNumber;
+    int LastFeatureNumber;
+
+    public void Init()
+    {
+        LastComponentNumber = -1; ;
+        LastFeatureNumber = -1;
+    }
+
+    public int CalcW(int component, int feature)
+    {
+        int result;
+        if (component > LastComponentNumber)
+            result = 2;
+        else
+            result = 1;
+        LastComponentNumber = component;
+        LastFeatureNumber = feature;
+        return result;
+    }
+}
+
+public partial class Postprocessor : TPostprocessor
+{
+    #region Common variables definition
+
+    ///<summary>Current nc-file. It could be main or sub.</summary>
+    NCFile nc;
+    ///<summary>Main nc-file (in opposite to subroutine)</summary>
+    NCFile mainNC;
+    ///<summary>The way to output circles G02/G03: false - through IJK, true - through R</summary>
+    bool CirclesThroughRadius = false;
+    ///<summary>G81-G89 cycle is on</summary>
+    bool cycleIsOn = false;
+    ///<summary>Current plane sign +1 or -1</summary>
+    int planeSign = 1;
+    ///<summary>Current plane third coordinate 3, 2 or 1</summary>
+    int planeZIndex = 3;
+
+    /// <summary>
+    /// To remember current state for the probing cycles.
+    /// </summary>
+    ProbingCycleState probingCycle;
+
+    ///<summary>Tool is a same as previous</summary>
+    bool SameTool = false;
+
+    ///<summary>Button clicked as the answer when cycle error appeared.</summary>
+    MsgClickedBtn cycleNonImplementedAnswer;
+
+    #endregion
+
+    public Postprocessor()
+    {
+
+    }
+
+    void PrintAllTools()
+    {
+        SortedList tools = new SortedList();
+        for (int i = 0; i < CLDProject.Operations.Count; i++)
+        {
+            var op = CLDProject.Operations[i];
+            if (op.Tool == null || op.Tool.Command == null)
+                continue;
+            if (!tools.ContainsKey(op.Tool.Number))
+                tools.Add(op.Tool.Number, Transliterate(op.Tool.Caption));
+        }
+        nc.WriteLine("( Tools list )");
+        NumericNCWord toolNum = new NumericNCWord("T{00}", 0);
+        for (int i = 0; i < tools.Count; i++)
+        {
+            toolNum.v = Convert.ToInt32(tools.GetKey(i));
+            nc.WriteLine(String.Format("( {0}    {1} )", toolNum.ToString(), tools.GetByIndex(i)));
         }
     }
 
-    public struct ProbingCycleState
+    void OutG53ABC()
     {
-        int LastComponentNumber;
-        int LastFeatureNumber;
-
-        public void Init() {
-            LastComponentNumber = -1;;
-            LastFeatureNumber = -1;
-        }
-
-        public int CalcW(int component, int feature) {
-            int result;
-            if (component>LastComponentNumber)
-                result = 2;
-            else
-                result = 1;
-            LastComponentNumber = component;
-            LastFeatureNumber = feature;
-            return result;
-        }
+        var s = "";
+        if (CLDProject.Machine.HasAAxis)
+            s += nc.A.ToString();
+        if (CLDProject.Machine.HasBAxis)
+            s += nc.B.ToString();
+        if (CLDProject.Machine.HasCAxis)
+            s += nc.C.ToString();
+        if (!String.IsNullOrEmpty(s))
+            nc.OutWithN("G53", s);
     }
 
-    public partial class Postprocessor: TPostprocessor
+    public override void OnStartProject(ICLDProject prj)
     {
-        #region Common variables definition
+        probingCycle.Init();
 
-        ///<summary>Current nc-file. It could be main or sub.</summary>
-        NCFile nc;
-        ///<summary>Main nc-file (in opposite to subroutine)</summary>
-        NCFile mainNC;
-        ///<summary>The way to output circles G02/G03: false - through IJK, true - through R</summary>
-        bool CirclesThroughRadius = false;
-        ///<summary>G81-G89 cycle is on</summary>
-        bool cycleIsOn = false;
-        ///<summary>Current plane sign +1 or -1</summary>
-        int planeSign = 1;
-        ///<summary>Current plane third coordinate 3, 2 or 1</summary>
-        int planeZIndex = 3;
+        mainNC = new NCFile();
+        nc = mainNC;
+        nc.OutputFileName = Settings.Params.Str["OutFiles.NCFileName"];
+        // Log.Info("Output file name: " + nc.OutputFileName);
+        nc.ProgNumber = Settings.Params.Int["OutFiles.NCProgNumber"];
 
-        /// <summary>
-        /// To remember current state for the probing cycles.
-        /// </summary>
-        ProbingCycleState probingCycle;
+        CirclesThroughRadius = Settings.Params.Bol["BlockFormat.CirclesThroughRadius"];
 
-        ///<summary>Tool is a same as previous</summary>
-        bool SameTool = false;
+        if (Settings.Params.Bol["BlockFormat.Numbering"])
+            nc.BlockN.Show();
+        else
+            nc.BlockN.Disable();
+        if (Settings.Params.Bol["BlockFormat.Spaces"])
+            nc.Block.WordsSeparator = " ";
+        else
+            nc.Block.WordsSeparator = "";
 
-        ///<summary>Button clicked as the answer when cycle error appeared.</summary>
-        MsgClickedBtn cycleNonImplementedAnswer;
+        nc.WriteLine("%");
+        nc.WriteLine("O" + Str(nc.ProgNumber));
 
-        #endregion
+        nc.WriteLine();
+        nc.WriteLine(String.Format("( {0} )", "Generated by CAM"));
+        nc.WriteLine(String.Format("( {0} )", "Date: " + DateTime.Now.ToShortDateString()));
+        nc.WriteLine(String.Format("( {0} )", "Time: " + DateTime.Now.ToShortTimeString()));
+        nc.WriteLine();
 
-        public Postprocessor()
-        {
-            
-        }
+        PrintAllTools();
+        nc.WriteLine();
 
-        void PrintAllTools(){
-            SortedList tools = new SortedList();
-            for (int i=0; i<CLDProject.Operations.Count; i++){
-                var op = CLDProject.Operations[i];
-                if (op.Tool==null || op.Tool.Command==null)
-                    continue;
-                if (!tools.ContainsKey(op.Tool.Number))
-                    tools.Add(op.Tool.Number, Transliterate(op.Tool.Caption));
-            }            
-            nc.WriteLine("( Tools list )");
-            NumericNCWord toolNum = new NumericNCWord("T{00}", 0);
-            for (int i=0; i<tools.Count; i++){
-                toolNum.v = Convert.ToInt32(tools.GetKey(i));
-                nc.WriteLine(String.Format("( {0}    {1} )", toolNum.ToString(), tools.GetByIndex(i)));
-            }
-        }
+        nc.Block.Show(nc.GAbsInc, nc.GFeed, nc.GMeasure, nc.GWCS, nc.GLCS, nc.GPlane,
+            nc.GLCompens, nc.GRCompens, nc.GInterp, nc.GCycle);
+        nc.Block.Out();
+        nc.OutWithN("G53", nc.Z.ToString(0));
+        OutG53ABC();
+    }
 
-        void OutG53ABC()
-        {
-            var s = "";
-            if (CLDProject.Machine.HasAAxis)
-                s += nc.A.ToString();
-            if (CLDProject.Machine.HasBAxis)
-                s += nc.B.ToString();
-            if (CLDProject.Machine.HasCAxis)
-                s += nc.C.ToString();
-            if (!String.IsNullOrEmpty(s))
-                nc.OutWithN("G53", s);
-        }
+    public override void OnFinishProject(ICLDProject prj)
+    {
+        nc.Block.Out();
+        nc.Output("M30");
+    }
 
-        public override void OnStartProject(ICLDProject prj)
-        {
-            probingCycle.Init();
-
-            mainNC = new NCFile();
-            nc = mainNC;
-            nc.OutputFileName = Settings.Params.Str["OutFiles.NCFileName"];
-            // Log.Info("Output file name: " + nc.OutputFileName);
-            nc.ProgNumber = Settings.Params.Int["OutFiles.NCProgNumber"];
-            
-            CirclesThroughRadius = Settings.Params.Bol["BlockFormat.CirclesThroughRadius"];
-            
-            if (Settings.Params.Bol["BlockFormat.Numbering"])
-                nc.BlockN.Show();
-            else
-                nc.BlockN.Disable();
-            if (Settings.Params.Bol["BlockFormat.Spaces"])
-                nc.Block.WordsSeparator = " ";
-            else
-                nc.Block.WordsSeparator = "";
-
-            nc.WriteLine("%");
-            nc.WriteLine("O" + Str(nc.ProgNumber));
-
+    public override void OnStartTechOperation(ICLDTechOperation op, ICLDPPFunCommand cmd, CLDArray cld)
+    {
+        // One empty line between operations if the operation has a new tool 
+        SameTool = !op.Enabled;
+        if (!SameTool)
             nc.WriteLine();
-            nc.WriteLine(String.Format("( {0} )", "Generated by CAM"));
-            nc.WriteLine(String.Format("( {0} )", "Date: " + DateTime.Now.ToShortDateString()));
-            nc.WriteLine(String.Format("( {0} )", "Time: " + DateTime.Now.ToShortTimeString()));
-            nc.WriteLine();
-
-            PrintAllTools();
-            nc.WriteLine();
-
-            nc.Block.Show(nc.GAbsInc, nc.GFeed ,nc.GMeasure, nc.GWCS, nc.GLCS, nc.GPlane, 
-                nc.GLCompens, nc.GRCompens, nc.GInterp, nc.GCycle);
-            nc.Block.Out();
+        nc.OutWithN("( " + Transliterate(op.CLDFile.Caption) + " )");
+        if (op.Tool != null && op.Tool.Command != null)
+        {
             nc.OutWithN("G53", nc.Z.ToString(0));
-            OutG53ABC();
-        }
-
-        public override void OnFinishProject(ICLDProject prj)
-        {
+            if (nc.A.Changed || nc.B.Changed || nc.C.Changed)
+                OutG53ABC();
+            nc.T.Show(op.Tool.Number);
+            nc.M.Show(6);
+            nc.TrailingComment.v = Transliterate(op.Tool.Caption);
+            nc.TrailingComment.v0 = "";
             nc.Block.Out();
-            nc.Output("M30");
+            // var s = nc.Block.Form();
+            // nc.WriteLine(s + " ( " + op.Tool.Caption + " )");
+            nc.Block.Reset(nc.X, nc.Y, nc.Z, nc.A, nc.B, nc.C, nc.F);
         }
-
-        public override void OnStartTechOperation(ICLDTechOperation op, ICLDPPFunCommand cmd, CLDArray cld)
+        if (op.WorkpieceCSCommand != null)
         {
-            // One empty line between operations if the operation has a new tool 
-            SameTool = !op.Enabled;
-            if (!SameTool)
-                nc.WriteLine();
-            nc.OutWithN("( " + Transliterate(op.CLDFile.Caption) + " )");
-            if (op.Tool!=null && op.Tool.Command!=null) {
-                nc.OutWithN("G53", nc.Z.ToString(0));
-                if(nc.A.Changed || nc.B.Changed || nc.C.Changed)                
-                    OutG53ABC();
-                nc.T.Show(op.Tool.Number);
-                nc.M.Show(6);
-                nc.TrailingComment.v = Transliterate(op.Tool.Caption);
-                nc.TrailingComment.v0 = "";
-                nc.Block.Out();
-                // var s = nc.Block.Form();
-                // nc.WriteLine(s + " ( " + op.Tool.Caption + " )");
-                nc.Block.Reset(nc.X, nc.Y, nc.Z, nc.A, nc.B, nc.C, nc.F);
-            }
-            if (op.WorkpieceCSCommand!=null) {
-                nc.GWCS.v = op.WorkpieceCSCommand.CSNumber;
-                nc.Block.Out();
-            }
-            nc.GInterp.Reset();
-        }
-
-        public override void OnCallNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
-        {
-            cldSub.Tag = mainNC.ProgNumber + cldSub.SubCode;
-            nc.M.Show(98);
-            nc.PSubCall.Show(cldSub.Tag);
+            nc.GWCS.v = op.WorkpieceCSCommand.CSNumber;
             nc.Block.Out();
-            if (!cldSub.Translated)
-                cldSub.Translate();
         }
+        nc.GInterp.Reset();
+    }
 
-        public override void OnStartNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
+    public override void OnCallNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
+    {
+        cldSub.Tag = mainNC.ProgNumber + cldSub.SubCode;
+        nc.M.Show(98);
+        nc.PSubCall.Show(cldSub.Tag);
+        nc.Block.Out();
+        if (!cldSub.Translated)
+            cldSub.Translate();
+    }
+
+    public override void OnStartNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
+    {
+        nc = new NCFile();
+        nc.ProgNumber = cldSub.Tag;
+        string path = Path.GetDirectoryName(mainNC.OutputFileName);
+        string name = Path.GetFileNameWithoutExtension(mainNC.OutputFileName);
+        string ext = Path.GetExtension(mainNC.OutputFileName);
+        nc.OutputFileName = Path.Combine(path, name + "_sub_" + Str(nc.ProgNumber) + ext);
+        nc.WriteLine("%");
+        nc.WriteLine("O" + Str(nc.ProgNumber));
+    }
+
+    public override void OnFinishNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
+    {
+        nc.Block.Out();
+        nc.M.Show(99);
+        nc.Block.Out();
+        nc = mainNC;
+        nc.Block.Reset(nc.X, nc.Y, nc.Z, nc.A, nc.B, nc.C, nc.F, nc.GInterp);
+    }
+
+    public override void OnPlane(ICLDPlaneCommand cmd, CLDArray cld)
+    {
+        nc.GPlane.v = cmd.PlaneGCode;
+        planeSign = cmd.PlaneSign;
+        switch (cmd.Plane)
         {
-            nc = new NCFile();
-            nc.ProgNumber = cldSub.Tag;
-            string path = Path.GetDirectoryName(mainNC.OutputFileName);
-            string name = Path.GetFileNameWithoutExtension(mainNC.OutputFileName);
-            string ext = Path.GetExtension(mainNC.OutputFileName);
-            nc.OutputFileName = Path.Combine(path, name + "_sub_" + Str(nc.ProgNumber) + ext);
-            nc.WriteLine("%");
-            nc.WriteLine("O" + Str(nc.ProgNumber));
+            case CLDPlaneType.XY:
+            case CLDPlaneType.InvXY:
+                planeZIndex = 3;
+                nc.PlaneZReg = nc.Z;
+                break;
+            case CLDPlaneType.ZX:
+            case CLDPlaneType.InvZX:
+                planeZIndex = 2;
+                nc.PlaneZReg = nc.Y;
+                break;
+            case CLDPlaneType.YZ:
+            case CLDPlaneType.InvYZ:
+                planeZIndex = 1;
+                nc.PlaneZReg = nc.X;
+                break;
         }
+    }
 
-        public override void OnFinishNCSub(ICLDSub cldSub, ICLDPPFunCommand cmd, CLDArray cld)
+    public override void OnSpindle(ICLDSpindleCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
         {
-            nc.Block.Out();
-            nc.M.Show(99);
-            nc.Block.Out();
-            nc = mainNC;
-            nc.Block.Reset(nc.X, nc.Y, nc.Z, nc.A, nc.B, nc.C, nc.F, nc.GInterp);
-        }
-
-        public override void OnPlane(ICLDPlaneCommand cmd, CLDArray cld)
-        {
-            nc.GPlane.v = cmd.PlaneGCode;
-            planeSign = cmd.PlaneSign;
-            switch (cmd.Plane) {
-                case CLDPlaneType.XY: 
-                case CLDPlaneType.InvXY:
-                    planeZIndex = 3;
-                    nc.PlaneZReg = nc.Z;
-                    break;
-                case CLDPlaneType.ZX: 
-                case CLDPlaneType.InvZX:
-                    planeZIndex = 2;
-                    nc.PlaneZReg = nc.Y;
-                    break;
-                case CLDPlaneType.YZ: 
-                case CLDPlaneType.InvYZ:
-                    planeZIndex = 1;
-                    nc.PlaneZReg = nc.X;
-                    break;
-            }
-        }
-
-        public override void OnSpindle(ICLDSpindleCommand cmd, CLDArray cld)
-        {  
-            if (cmd.IsOn) {
-                // Stop if spindle reverse
-                if ((cmd.IsClockwiseDir && nc.MSpindle==4) || (!cmd.IsClockwiseDir && nc.MSpindle==3)) {
-                    nc.MSpindle.Show(5);
-                    nc.Block.Out();
-                }
-                if (cmd.IsCSS) {
-                    nc.GCssRpm.v = 96;
-                    nc.S.Show(cmd.CSSValue);
-                } else {
-                    nc.GCssRpm.v = 97;
-                    nc.S.Show(cmd.RPMValue);
-                }
-                if (cmd.IsClockwiseDir)
-                    nc.MSpindle.Show(3);
-                else
-                    nc.MSpindle.Show(4);
-                if( !SameTool || !nc.S.ValuesSame || !nc.MSpindle.ValuesSame) 
-                    nc.Block.Out();
-                else 
-                    nc.Block.Hide(nc.S, nc.MSpindle);
-            } else if (cmd.IsOff) {
-                nc.MSpindle.v = 5;
-                nc.Block.Out();
-            } else if (cmd.IsOrient) {
-                nc.M.Show(19);
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnComment(ICLDCommentCommand cmd, CLDArray cld)
-        {
-            if (!(cmd.IsOperationName || cmd.IsToolName)) {
-                nc.OutWithN("( " + Transliterate(cmd.CLDataS) + " )");
-            }
-        }
-
-        public override void OnWorkpieceCS(ICLDOriginCommand cmd, CLDArray cld)
-        {
-            nc.GWCS.v = cmd.CSNumber;
-        }
-
-        public override void OnLocalCS(ICLDOriginCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                nc.GLCS.Show(68.2);
-                nc.X.Show(cmd.WCS.P.X);
-                nc.Y.Show(cmd.WCS.P.Y);
-                nc.Z.Show(cmd.WCS.P.Z);
-                nc.I.Show(cmd.WCS.N.A);
-                nc.J.Show(cmd.WCS.N.B);
-                nc.K.Show(cmd.WCS.N.C);  
-                nc.Block.Hide(nc.GInterp);              
-                nc.Block.Out();
-                nc.Block.Reset(nc.X, nc.Y, nc.Z);
-                nc.OutWithN("G53.1");
-            } else {
-                nc.GLCS.Show(69);
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnLengthCompensation(ICLDCutComCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                nc.GLCompens.Reset(43);
-                nc.HLCompens.Reset(cmd.CorrectorNumber);
-            } else {
-                nc.GLCompens.Show(49);
-                nc.HLCompens.Hide(0);
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnRadiusCompensation(ICLDCutComCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                if (cmd.IsLeftDirection)
-                    nc.GRCompens.Show(41);
-                else
-                    nc.GRCompens.Show(42);
-                nc.DRCompens.Show(cmd.CorrectorNumber);
-            } else {
-                nc.GRCompens.Show(40);
-            }
-        }
-
-        public override void OnCoolant(ICLDCoolantCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                nc.MCoolant.v = 8;
-            } else {
-                nc.MCoolant.v = 9;
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnMoveVelocity(ICLDMoveVelocityCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsRapid) {
-                nc.GInterp.v = 0;
-            } else {
-                if (nc.GInterp == 0)
-                    nc.GInterp.v = 1;
-                nc.F.v = cmd.FeedValue;
-            }
-        }
-
-        public override void OnGoto(ICLDGotoCommand cmd, CLDArray cld)
-        {
-            if (nc.GInterp > 1)
-                nc.GInterp.v = 1;
-            nc.X.v = cmd.EP.X;
-            nc.Y.v = cmd.EP.Y;
-            nc.Z.v = cmd.EP.Z;
-
-            if (!cycleIsOn) {
-                if (nc.Z.Changed && nc.GLCompens.ValuesDiffer) {
-                    nc.Block.Hide(nc.X, nc.Y);
-                    nc.Block.Show(nc.GLCompens, nc.HLCompens, nc.Z);
-                    nc.Block.Out();
-                    nc.Block.UpdateState(nc.X, nc.Y);
-                }            
-                // Uncomment if you want mandatory XYZABC in TCPM mode
-                // if (nc.GLCompens == 43.4) {
-                //     nc.Block.Show(nc.X, nc.Y, nc.Z);
-                //     if (CLDProject.Machine.HasAAxis)
-                //         nc.A.Show();
-                //     if (CLDProject.Machine.HasBAxis)
-                //         nc.B.Show();
-                //     if (CLDProject.Machine.HasCAxis)
-                //         nc.C.Show();
-                // } 
-                if(nc.X.Changed || nc.Y.Changed || nc.Z.Changed )               
-                    nc.Block.Out();
-            }
-            nc.LastP = cmd.EP;
-        }
-
-        public override void OnMultiGoto(ICLDMultiGotoCommand cmd, CLDArray cld)
-        {
-            if (nc.GInterp > 1)
-                nc.GInterp.v = 1;
-            nc.Block.SetMarks(false);
-            foreach(CLDMultiMotionAxis ax in cmd.Axes) {
-                if (ax.IsX) {
-                    nc.X.v = ax.Value;
-                    nc.X.Marked = nc.X.ValuesDiffer;
-                } else if (ax.IsY) {
-                    nc.Y.v = ax.Value;
-                    nc.Y.Marked = nc.Y.ValuesDiffer;
-                } else if (ax.IsZ) {
-                    nc.Z.v = ax.Value;
-                    nc.Z.Marked = nc.Z.ValuesDiffer;
-                } else if (ax.IsA) { 
-                    nc.A.v = ax.Value;
-                    nc.A.Marked = nc.A.ValuesDiffer;
-                } else if (ax.IsB)  {
-                    nc.B.v = ax.Value;
-                    nc.B.Marked = nc.B.ValuesDiffer;
-                } else if (ax.IsC) { 
-                    nc.C.v = ax.Value;
-                    nc.C.Marked = nc.C.ValuesDiffer;
-                }
-            }
-            if (!cycleIsOn) {
-                if (nc.Z.Marked && nc.GLCompens.ValuesDiffer) {
-                    foreach (NCWord w in nc.Block.MarkedWords) 
-                        if (w!=nc.Z)
-                            w.Hide();
-                    nc.Block.Show(nc.GLCompens, nc.HLCompens, nc.Z);
-                    nc.Block.Out();
-                    foreach (NCWord w in nc.Block.MarkedWords) 
-                        if (w!=nc.Z)
-                            w.Show();
-                }            
-                // Uncomment if you want mandatory XYZABC in TCPM mode
-                // if (nc.GLCompens == 43.4) {
-                //     nc.Block.Show(nc.X, nc.Y, nc.Z);
-                //     if (CLDProject.Machine.HasAAxis)
-                //         nc.A.Show();
-                //     if (CLDProject.Machine.HasBAxis)
-                //         nc.B.Show();
-                //     if (CLDProject.Machine.HasCAxis)
-                //         nc.C.Show();
-                // }                
-                nc.Block.Out();
-            }
-            nc.LastP = cmd.EP;
-        }
-
-        public override void OnPhysicGoto(ICLDPhysicGotoCommand cmd, CLDArray cld)
-        {
-            foreach(CLDMultiMotionAxis ax in cmd.Axes) {
-                if (ax.IsX) {
-                    nc.X.Show(ax.Value);
-                } else if (ax.IsY) {
-                    nc.Y.Show(ax.Value);
-                } else if (ax.IsZ) {
-                    nc.Z.Show(ax.Value);
-                } else if (ax.IsA) { 
-                    nc.A.Show(ax.Value);
-                } else if (ax.IsB)  {
-                    nc.B.Show(ax.Value);
-                } else if (ax.IsC) { 
-                    nc.C.Show(ax.Value);
-                }
-            }
-            if (nc.X.Changed || nc.Y.Changed || nc.Z.Changed || nc.A.Changed || nc.B.Changed || nc.C.Changed) {
-                nc.GHome.Show(53);
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnGoHome(ICLDGoHomeCommand cmd, CLDArray cld)
-        {
-            foreach(CLDMultiMotionAxis ax in cmd.Axes) {
-                if (ax.IsX) {
-                    nc.U.Show(0);
-                } else if (ax.IsY) {
-                    nc.V.Show(0);
-                } else if (ax.IsZ) {
-                    nc.W.Show(0);
-                }
-            }
-            if (nc.U.Changed || nc.V.Changed || nc.W.Changed) {
-                nc.GHome.Show(28);
-                nc.Block.Out();
-            }
-        }
-
-        public override void OnCircle(ICLDCircleCommand cmd, CLDArray cld)
-        {
-            nc.GInterp.Show(cmd.Dir);
-            nc.X.v = cmd.EP.X;
-            nc.Y.v = cmd.EP.Y;
-            nc.Z.v = cmd.EP.Z;
-            if (!CirclesThroughRadius || IsEqD(cmd.Ang, 180, 2.5) || IsEqD(cmd.Ang, 360, 2.5) || (!IsZeroD(cmd.HelixAng, Zero))) {
-                // Center output
-                switch (Abs(cmd.Plane)) {
-                    case 17:
-                        nc.I.v = cmd.IncCenter.X;
-                        nc.J.v = cmd.IncCenter.Y;   
-                        nc.Block.Show(nc.X, nc.Y, nc.I, nc.J);  
-                    break;
-                    case 18:
-                        nc.I.v = cmd.IncCenter.X;    
-                        nc.K.v = cmd.IncCenter.Z;   
-                        nc.Block.Show(nc.X, nc.Z, nc.I, nc.K);   
-                    break;
-                    case 19:  
-                        nc.J.v = cmd.IncCenter.Y;
-                        nc.K.v = cmd.IncCenter.Z;   
-                        nc.Block.Show(nc.Y, nc.Z, nc.J, nc.K);                        
-                    break;
-                }
-            } else {
-                // Radius output                  
-                nc.R.Show(cmd.RIso);
-                switch (Abs(cmd.Plane)) {
-                    case 17:
-                        nc.Block.Show(nc.X, nc.Y);
-                        break;
-                    case 18:
-                        nc.Block.Show(nc.Z, nc.X);
-                        break;
-                    case 19:
-                        nc.Block.Show(nc.Y, nc.Z);
-                        break;
-                }
-            }
-            nc.Block.Out();
-            nc.LastP = cmd.EP;
-        }
-
-        public override void OnAxesBrake(ICLDAxesBrakeCommand cmd, CLDArray cld)
-        {
-            foreach(CLDAxisBrake ax in cmd.Axes) {
-                if (ax.IsA) {
-                    if (ax.StateIsOn)
-                        nc.MABrake.v = 593;
-                    else
-                        nc.MABrake.v = 592;
-                } else if (ax.IsB) {
-                    if (ax.StateIsOn)
-                        nc.MBBrake.v = 595;
-                    else
-                        nc.MBBrake.v = 594;
-                } else if (ax.IsC) {
-                    if (ax.StateIsOn)
-                        nc.MCBrake.v = 597;
-                    else
-                        nc.MCBrake.v = 596;
-                }
-            }
-            if (nc.MABrake.Changed || nc.MBBrake.Changed || nc.MCBrake.Changed)
-                nc.Block.Out();
-        }
-
-        public override void OnInterp5x(ICLDInterpolationCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                nc.GLCompens.v = 43.4;
-                nc.HLCompens.Show();
-                nc.Z.Show();
-            } else {
-                nc.GLCompens.v = 49;
-            }
-            // nc.Block.Out();
-        }
-
-        public override void OnHoleExtCycle(ICLDExtCycleCommand cmd, CLDArray cld)
-        {
-            if (cmd.IsOn) {
-                cycleIsOn = true;
-                nc.GCycle.Reset(80);
-            } else if (cmd.IsOff) {
-                nc.GCycle.v = 80;
-                nc.Block.Out();
-                cycleIsOn = false;
-            } else if (cmd.IsCall) {
-                int sg = -cld[2+planeZIndex];
-                double curPos = nc.LastP[planeZIndex];
-                nc.PlaneZReg.v = curPos - cld[8]*sg;
-                nc.RSafeLevel.v = curPos - cld[6]*sg;
-                if (cld[9] == 0) 
-                    nc.F.v = cld[10]*nc.S; 
-                else 
-                    nc.F.v = cld[10];
-                nc.GInterp.Hide(1);
-                nc.GCycle.v = cmd.CycleType-400;
-                switch (cmd.CycleType) {
-                    case CLDConst.W5DDrill:
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DFace:
-                        nc.PDrillPause.v = cld[15]*1000;
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DChipRemoving:
-                    case CLDConst.W5DChipBreaking:
-                        nc.QStep.v = cld[17];
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.QStep);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DTap:                            // Thread tapping G84, G74
-                        if (nc.MSpindle == 4)            
-                            nc.GCycle.v = 74;                        // Left thread tapping G74           
-                        if (cld[19]==1 & nc.GCycle.Changed) 
-                            nc.OutWithN("M29", nc.S.ToString());     // fixed tap without compensating device
-                        if (cld[15]>0 & nc.GCycle.Changed) 
-                            nc.PDrillPause.Show(cld[15]*1000);                            
-                        else 
-                            nc.PDrillPause.Hide();
-                        if (cld[20]>0 & nc.GCycle.Changed)
-                            nc.QStep.Show(cld[21]);
-                        else 
-                            nc.QStep.Hide();
-                        nc.F.v = cld[17]*nc.S ;                        
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.GCycle, nc.PlaneZReg, nc.RSafeLevel, nc.F);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DBore5:                           // Hole boring G85
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DBore6:                           // Finish boring G76 instead of G86
-                        nc.GCycle.v = 76;  
-                        if (cld[17]>0 & nc.GCycle.Changed) {
-                            nc.PDrillPause.Show(cld[17]*1000);
-                            nc.QStep.Show(Sqrt(Sqr(cld[19]) + Sqr(cld[20]) + Sqr(cld[21])));                           
-                        }else {
-                            nc.PDrillPause.Hide();
-                            nc.QStep.Hide();
-                        }
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
-                        nc.Block.Out();  
-                        break;
-                    case CLDConst.W5DBore7:                           // Hole back boring G87
-                         if (cld[17]>0 & nc.GCycle.Changed) {
-                            nc.PDrillPause.Show(cld[17]*1000);
-                            nc.QStep.Show(Sqrt(Sqr(cld[19]) + Sqr(cld[20]) + Sqr(cld[21])));                           
-                         }else {
-                            nc.QStep.Hide();
-                            nc.PDrillPause.Hide();
-                        }
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DBore8:                           // Hole boring G88
-                         nc.PDrillPause.v = cld[15]*1000;
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
-                        nc.Block.Out();
-                        break;
-                    case CLDConst.W5DBore9:                           // Hole boring G89
-                        nc.PDrillPause.v = cld[15]*1000;
-                        if (nc.GCycle.Changed) 
-                            nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
-                        nc.Block.Out();
-                        break;
-                    // case CLDConst.W5DThreadMill:
-                    //     break;
-                    // case CLDConst.W5DHolePocketing:
-                    //     break;
-                    // case CLDConst.W5DGrooveBoring:
-                    //     break;
-                    default: 
-                        nc.WriteLine($"   ERROR: cycle {nc.GCycle} not implemented for the operation '{CurrentOperation.Comment}'");
-                        Log.Error($"Cycle {nc.GCycle} not implemented for the operation '{CurrentOperation.Comment}'");
-                        if ((cycleNonImplementedAnswer != MsgClickedBtn.Ignore) && !IsSilentMode()) {
-                            cycleNonImplementedAnswer = Log.MessageBox(
-                                $"The postprocessor does not implement {nc.GCycle} hole cycle.\r\n" +
-                                $"Try to use 'long hand' cycle format instead for the operation: '{CurrentOperation.Comment}'.\r\n" + 
-                                "Do you want to abort translation?",
-                                $"ERROR: cycle {nc.GCycle} not implemented!!!",
-                                MsgType.Error,
-                                MsgBtnSet.AbortRetryIgnore,
-                                MsgDefBtn.Button1
-                            );
-                            if (cycleNonImplementedAnswer==MsgClickedBtn.Abort)
-                                BreakTranslation();
-                        }
-                        break;
-                }
-            }
-        }
-
-        bool IsSilentMode()
-        {
-            return IsTestsMode || IsReverseInterpretation;
-        }
-
-        private void OutG65_P(int P, params (string, double) [] pairs)
-        {
-            OutG65_P(P, null, pairs);
-        }
-        
-        private void OutG65_P(int P, string comment, params (string, double)[] pairs)
-        {
-            string res = nc.GCycle.ToString(65) + " " + nc.PSubCall.ToString(P);
-            for (int i = 0; i < pairs.Length; i++) {
-                res += " " + pairs[i].Item1 + nc.Number.ToString(pairs[i].Item2);
-            }
-            if (!string.IsNullOrEmpty(comment))
-                res += $" ( {comment} )";
-            nc.OutWithN(res);
-        }
-
-        private int GetWorkOffsetNumber(ICLDExtCycleCommand cmd)
-        {   var OffsetNumber = -1;
-            var WCSOffsetType = cmd.Prm.Int[-10];
-            if (WCSOffsetType == 1 || WCSOffsetType == 2)
+            // Stop if spindle reverse
+            if ((cmd.IsClockwiseDir && nc.MSpindle == 4) || (!cmd.IsClockwiseDir && nc.MSpindle == 3))
             {
-                var WCSOffsetValue = cmd.Prm.Int[-11];
-                switch (WCSOffsetValue)
-                {
-                    case 54:
-                        OffsetNumber = 1;
-                        break;
-                    case 55:
-                        OffsetNumber = 2;
-                        break;
-                    case 56:
-                        OffsetNumber = 3;
-                        break;
-                    case 57:
-                        OffsetNumber = 4;
-                        break;
-                    case 58:
-                        OffsetNumber = 5;
-                        break;
-                    case 59:
-                        OffsetNumber = 6;
-                        break;
-                    default:
-                        OffsetNumber = WCSOffsetValue;
-                        break;
-                }
+                nc.MSpindle.Show(5);
+                nc.Block.Out();
             }
-            return OffsetNumber;
-        }
-
-        public void GenerateDoubleWall(int PCom, ICLDExtCycleCommand cmd)
-        {
-            var CountStep1 = cmd.Prm.Int[-63];
-            var CountStep2 = cmd.Prm.Int[-64];
-            if (CountStep1>2 || CountStep2>2)
+            if (cmd.IsCSS)
             {
-                Log.Error("Measure count is not available for this machining center"); 
+                nc.GCssRpm.v = 96;
+                nc.S.Show(cmd.CSSValue);
             }
             else
             {
-                var ax1 = "";
-                var ax2 = "";
-                var IncDistanceName1 = "";
-                var IncDistanceName2 = "";
-                var AxParamInd1 = 0;
-                var AxParamInd2 = 0;
+                nc.GCssRpm.v = 97;
+                nc.S.Show(cmd.RPMValue);
+            }
+            if (cmd.IsClockwiseDir)
+                nc.MSpindle.Show(3);
+            else
+                nc.MSpindle.Show(4);
+            if (!SameTool || !nc.S.ValuesSame || !nc.MSpindle.ValuesSame)
+                nc.Block.Out();
+            else
+                nc.Block.Hide(nc.S, nc.MSpindle);
+        }
+        else if (cmd.IsOff)
+        {
+            nc.MSpindle.v = 5;
+            nc.Block.Out();
+        }
+        else if (cmd.IsOrient)
+        {
+            nc.M.Show(19);
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnComment(ICLDCommentCommand cmd, CLDArray cld)
+    {
+        if (!(cmd.IsOperationName || cmd.IsToolName))
+        {
+            nc.OutWithN("( " + Transliterate(cmd.CLDataS) + " )");
+        }
+    }
+
+    public override void OnWorkpieceCS(ICLDOriginCommand cmd, CLDArray cld)
+    {
+        nc.GWCS.v = cmd.CSNumber;
+    }
+
+    public override void OnLocalCS(ICLDOriginCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            nc.GLCS.Show(68.2);
+            nc.X.Show(cmd.WCS.P.X);
+            nc.Y.Show(cmd.WCS.P.Y);
+            nc.Z.Show(cmd.WCS.P.Z);
+            nc.I.Show(cmd.WCS.N.A);
+            nc.J.Show(cmd.WCS.N.B);
+            nc.K.Show(cmd.WCS.N.C);
+            nc.Block.Hide(nc.GInterp);
+            nc.Block.Out();
+            nc.Block.Reset(nc.X, nc.Y, nc.Z);
+            nc.OutWithN("G53.1");
+        }
+        else
+        {
+            nc.GLCS.Show(69);
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnLengthCompensation(ICLDCutComCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            nc.GLCompens.Reset(43);
+            nc.HLCompens.Reset(cmd.CorrectorNumber);
+        }
+        else
+        {
+            nc.GLCompens.Show(49);
+            nc.HLCompens.Hide(0);
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnRadiusCompensation(ICLDCutComCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            if (cmd.IsLeftDirection)
+                nc.GRCompens.Show(41);
+            else
+                nc.GRCompens.Show(42);
+            nc.DRCompens.Show(cmd.CorrectorNumber);
+        }
+        else
+        {
+            nc.GRCompens.Show(40);
+        }
+    }
+
+    public override void OnCoolant(ICLDCoolantCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            nc.MCoolant.v = 8;
+        }
+        else
+        {
+            nc.MCoolant.v = 9;
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnMoveVelocity(ICLDMoveVelocityCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsRapid)
+        {
+            nc.GInterp.v = 0;
+        }
+        else
+        {
+            if (nc.GInterp == 0)
+                nc.GInterp.v = 1;
+            nc.F.v = cmd.FeedValue;
+        }
+    }
+
+    public override void OnGoto(ICLDGotoCommand cmd, CLDArray cld)
+    {
+        if (nc.GInterp > 1)
+            nc.GInterp.v = 1;
+        nc.X.v = cmd.EP.X;
+        nc.Y.v = cmd.EP.Y;
+        nc.Z.v = cmd.EP.Z;
+
+        if (!cycleIsOn)
+        {
+            if (nc.Z.Changed && nc.GLCompens.ValuesDiffer)
+            {
+                nc.Block.Hide(nc.X, nc.Y);
+                nc.Block.Show(nc.GLCompens, nc.HLCompens, nc.Z);
+                nc.Block.Out();
+                nc.Block.UpdateState(nc.X, nc.Y);
+            }
+            // Uncomment if you want mandatory XYZABC in TCPM mode
+            // if (nc.GLCompens == 43.4) {
+            //     nc.Block.Show(nc.X, nc.Y, nc.Z);
+            //     if (CLDProject.Machine.HasAAxis)
+            //         nc.A.Show();
+            //     if (CLDProject.Machine.HasBAxis)
+            //         nc.B.Show();
+            //     if (CLDProject.Machine.HasCAxis)
+            //         nc.C.Show();
+            // } 
+            if (nc.X.Changed || nc.Y.Changed || nc.Z.Changed)
+                nc.Block.Out();
+        }
+        nc.LastP = cmd.EP;
+    }
+
+    public override void OnMultiGoto(ICLDMultiGotoCommand cmd, CLDArray cld)
+    {
+        if (nc.GInterp > 1)
+            nc.GInterp.v = 1;
+        nc.Block.SetMarks(false);
+        foreach (CLDMultiMotionAxis ax in cmd.Axes)
+        {
+            if (ax.IsX)
+            {
+                nc.X.v = ax.Value;
+                nc.X.Marked = nc.X.ValuesDiffer;
+            }
+            else if (ax.IsY)
+            {
+                nc.Y.v = ax.Value;
+                nc.Y.Marked = nc.Y.ValuesDiffer;
+            }
+            else if (ax.IsZ)
+            {
+                nc.Z.v = ax.Value;
+                nc.Z.Marked = nc.Z.ValuesDiffer;
+            }
+            else if (ax.IsA)
+            {
+                nc.A.v = ax.Value;
+                nc.A.Marked = nc.A.ValuesDiffer;
+            }
+            else if (ax.IsB)
+            {
+                nc.B.v = ax.Value;
+                nc.B.Marked = nc.B.ValuesDiffer;
+            }
+            else if (ax.IsC)
+            {
+                nc.C.v = ax.Value;
+                nc.C.Marked = nc.C.ValuesDiffer;
+            }
+        }
+        if (!cycleIsOn)
+        {
+            if (nc.Z.Marked && nc.GLCompens.ValuesDiffer)
+            {
+                foreach (NCWord w in nc.Block.MarkedWords)
+                    if (w != nc.Z)
+                        w.Hide();
+                nc.Block.Show(nc.GLCompens, nc.HLCompens, nc.Z);
+                nc.Block.Out();
+                foreach (NCWord w in nc.Block.MarkedWords)
+                    if (w != nc.Z)
+                        w.Show();
+            }
+            // Uncomment if you want mandatory XYZABC in TCPM mode
+            // if (nc.GLCompens == 43.4) {
+            //     nc.Block.Show(nc.X, nc.Y, nc.Z);
+            //     if (CLDProject.Machine.HasAAxis)
+            //         nc.A.Show();
+            //     if (CLDProject.Machine.HasBAxis)
+            //         nc.B.Show();
+            //     if (CLDProject.Machine.HasCAxis)
+            //         nc.C.Show();
+            // }                
+            nc.Block.Out();
+        }
+        nc.LastP = cmd.EP;
+    }
+
+    public override void OnPhysicGoto(ICLDPhysicGotoCommand cmd, CLDArray cld)
+    {
+        foreach (CLDMultiMotionAxis ax in cmd.Axes)
+        {
+            if (ax.IsX)
+            {
+                nc.X.Show(ax.Value);
+            }
+            else if (ax.IsY)
+            {
+                nc.Y.Show(ax.Value);
+            }
+            else if (ax.IsZ)
+            {
+                nc.Z.Show(ax.Value);
+            }
+            else if (ax.IsA)
+            {
+                nc.A.Show(ax.Value);
+            }
+            else if (ax.IsB)
+            {
+                nc.B.Show(ax.Value);
+            }
+            else if (ax.IsC)
+            {
+                nc.C.Show(ax.Value);
+            }
+        }
+        if (nc.X.Changed || nc.Y.Changed || nc.Z.Changed || nc.A.Changed || nc.B.Changed || nc.C.Changed)
+        {
+            nc.GHome.Show(53);
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnGoHome(ICLDGoHomeCommand cmd, CLDArray cld)
+    {
+        foreach (CLDMultiMotionAxis ax in cmd.Axes)
+        {
+            if (ax.IsX)
+            {
+                nc.U.Show(0);
+            }
+            else if (ax.IsY)
+            {
+                nc.V.Show(0);
+            }
+            else if (ax.IsZ)
+            {
+                nc.W.Show(0);
+            }
+        }
+        if (nc.U.Changed || nc.V.Changed || nc.W.Changed)
+        {
+            nc.GHome.Show(28);
+            nc.Block.Out();
+        }
+    }
+
+    public override void OnCircle(ICLDCircleCommand cmd, CLDArray cld)
+    {
+        nc.GInterp.Show(cmd.Dir);
+        nc.X.v = cmd.EP.X;
+        nc.Y.v = cmd.EP.Y;
+        nc.Z.v = cmd.EP.Z;
+        if (!CirclesThroughRadius || IsEqD(cmd.Ang, 180, 2.5) || IsEqD(cmd.Ang, 360, 2.5) || (!IsZeroD(cmd.HelixAng, Zero)))
+        {
+            // Center output
+            switch (Abs(cmd.Plane))
+            {
+                case 17:
+                    nc.I.v = cmd.IncCenter.X;
+                    nc.J.v = cmd.IncCenter.Y;
+                    nc.Block.Show(nc.X, nc.Y, nc.I, nc.J);
+                    break;
+                case 18:
+                    nc.I.v = cmd.IncCenter.X;
+                    nc.K.v = cmd.IncCenter.Z;
+                    nc.Block.Show(nc.X, nc.Z, nc.I, nc.K);
+                    break;
+                case 19:
+                    nc.J.v = cmd.IncCenter.Y;
+                    nc.K.v = cmd.IncCenter.Z;
+                    nc.Block.Show(nc.Y, nc.Z, nc.J, nc.K);
+                    break;
+            }
+        }
+        else
+        {
+            // Radius output                  
+            nc.R.Show(cmd.RIso);
+            switch (Abs(cmd.Plane))
+            {
+                case 17:
+                    nc.Block.Show(nc.X, nc.Y);
+                    break;
+                case 18:
+                    nc.Block.Show(nc.Z, nc.X);
+                    break;
+                case 19:
+                    nc.Block.Show(nc.Y, nc.Z);
+                    break;
+            }
+        }
+        nc.Block.Out();
+        nc.LastP = cmd.EP;
+    }
+
+    public override void OnAxesBrake(ICLDAxesBrakeCommand cmd, CLDArray cld)
+    {
+        foreach (CLDAxisBrake ax in cmd.Axes)
+        {
+            if (ax.IsA)
+            {
+                if (ax.StateIsOn)
+                    nc.MABrake.v = 593;
+                else
+                    nc.MABrake.v = 592;
+            }
+            else if (ax.IsB)
+            {
+                if (ax.StateIsOn)
+                    nc.MBBrake.v = 595;
+                else
+                    nc.MBBrake.v = 594;
+            }
+            else if (ax.IsC)
+            {
+                if (ax.StateIsOn)
+                    nc.MCBrake.v = 597;
+                else
+                    nc.MCBrake.v = 596;
+            }
+        }
+        if (nc.MABrake.Changed || nc.MBBrake.Changed || nc.MCBrake.Changed)
+            nc.Block.Out();
+    }
+
+    public override void OnInterp5x(ICLDInterpolationCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            nc.GLCompens.v = 43.4;
+            nc.HLCompens.Show();
+            nc.Z.Show();
+        }
+        else
+        {
+            nc.GLCompens.v = 49;
+        }
+        // nc.Block.Out();
+    }
+
+    public override void OnHoleExtCycle(ICLDExtCycleCommand cmd, CLDArray cld)
+    {
+        if (cmd.IsOn)
+        {
+            cycleIsOn = true;
+            nc.GCycle.Reset(80);
+        }
+        else if (cmd.IsOff)
+        {
+            nc.GCycle.v = 80;
+            nc.Block.Out();
+            cycleIsOn = false;
+        }
+        else if (cmd.IsCall)
+        {
+            int sg = -cld[2 + planeZIndex];
+            double curPos = nc.LastP[planeZIndex];
+            nc.PlaneZReg.v = curPos - cld[8] * sg;
+            nc.RSafeLevel.v = curPos - cld[6] * sg;
+            if (cld[9] == 0)
+                nc.F.v = cld[10] * nc.S;
+            else
+                nc.F.v = cld[10];
+            nc.GInterp.Hide(1);
+            nc.GCycle.v = cmd.CycleType - 400;
+            switch (cmd.CycleType)
+            {
+                case CLDConst.W5DDrill:
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DFace:
+                    nc.PDrillPause.v = cld[15] * 1000;
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DChipRemoving:
+                case CLDConst.W5DChipBreaking:
+                    nc.QStep.v = cld[17];
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.QStep);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DTap:                            // Thread tapping G84, G74
+                    if (nc.MSpindle == 4)
+                        nc.GCycle.v = 74;                        // Left thread tapping G74           
+                    if (cld[19] == 1 & nc.GCycle.Changed)
+                        nc.OutWithN("M29", nc.S.ToString());     // fixed tap without compensating device
+                    if (cld[15] > 0 & nc.GCycle.Changed)
+                        nc.PDrillPause.Show(cld[15] * 1000);
+                    else
+                        nc.PDrillPause.Hide();
+                    if (cld[20] > 0 & nc.GCycle.Changed)
+                        nc.QStep.Show(cld[21]);
+                    else
+                        nc.QStep.Hide();
+                    nc.F.v = cld[17] * nc.S;
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.GCycle, nc.PlaneZReg, nc.RSafeLevel, nc.F);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DBore5:                           // Hole boring G85
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DBore6:                           // Finish boring G76 instead of G86
+                    nc.GCycle.v = 76;
+                    if (cld[17] > 0 & nc.GCycle.Changed)
+                    {
+                        nc.PDrillPause.Show(cld[17] * 1000);
+                        nc.QStep.Show(Sqrt(Sqr(cld[19]) + Sqr(cld[20]) + Sqr(cld[21])));
+                    }
+                    else
+                    {
+                        nc.PDrillPause.Hide();
+                        nc.QStep.Hide();
+                    }
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DBore7:                           // Hole back boring G87
+                    if (cld[17] > 0 & nc.GCycle.Changed)
+                    {
+                        nc.PDrillPause.Show(cld[17] * 1000);
+                        nc.QStep.Show(Sqrt(Sqr(cld[19]) + Sqr(cld[20]) + Sqr(cld[21])));
+                    }
+                    else
+                    {
+                        nc.QStep.Hide();
+                        nc.PDrillPause.Hide();
+                    }
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DBore8:                           // Hole boring G88
+                    nc.PDrillPause.v = cld[15] * 1000;
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
+                    nc.Block.Out();
+                    break;
+                case CLDConst.W5DBore9:                           // Hole boring G89
+                    nc.PDrillPause.v = cld[15] * 1000;
+                    if (nc.GCycle.Changed)
+                        nc.Block.Show(nc.PlaneZReg, nc.RSafeLevel, nc.F, nc.PDrillPause);
+                    nc.Block.Out();
+                    break;
+                // case CLDConst.W5DThreadMill:
+                //     break;
+                // case CLDConst.W5DHolePocketing:
+                //     break;
+                // case CLDConst.W5DGrooveBoring:
+                //     break;
+                default:
+                    nc.WriteLine($"   ERROR: cycle {nc.GCycle} not implemented for the operation '{CurrentOperation.Comment}'");
+                    Log.Error($"Cycle {nc.GCycle} not implemented for the operation '{CurrentOperation.Comment}'");
+                    if ((cycleNonImplementedAnswer != MsgClickedBtn.Ignore) && !IsSilentMode())
+                    {
+                        cycleNonImplementedAnswer = Log.MessageBox(
+                            $"The postprocessor does not implement {nc.GCycle} hole cycle.\r\n" +
+                            $"Try to use 'long hand' cycle format instead for the operation: '{CurrentOperation.Comment}'.\r\n" +
+                            "Do you want to abort translation?",
+                            $"ERROR: cycle {nc.GCycle} not implemented!!!",
+                            MsgType.Error,
+                            MsgBtnSet.AbortRetryIgnore,
+                            MsgDefBtn.Button1
+                        );
+                        if (cycleNonImplementedAnswer == MsgClickedBtn.Abort)
+                            BreakTranslation();
+                    }
+                    break;
+            }
+        }
+    }
+
+    bool IsSilentMode()
+    {
+        return IsTestsMode || IsReverseInterpretation;
+    }
+
+    private void OutG65_P(int P, params (string, double)[] pairs)
+    {
+        OutG65_P(P, null, pairs);
+    }
+
+    private void OutG65_P(int P, string comment, params (string, double)[] pairs)
+    {
+        string res = nc.GCycle.ToString(65) + " " + nc.PSubCall.ToString(P);
+        for (int i = 0; i < pairs.Length; i++)
+        {
+            res += " " + pairs[i].Item1 + nc.Number.ToString(pairs[i].Item2);
+        }
+        if (!string.IsNullOrEmpty(comment))
+            res += $" ( {comment} )";
+        nc.OutWithN(res);
+    }
+
+    private int GetWorkOffsetNumber(ICLDExtCycleCommand cmd)
+    {
+        var OffsetNumber = -1;
+        var WCSOffsetType = cmd.Prm.Int[-10];
+        if (WCSOffsetType == 1 || WCSOffsetType == 2)
+        {
+            var WCSOffsetValue = cmd.Prm.Int[-11];
+            switch (WCSOffsetValue)
+            {
+                case 54:
+                    OffsetNumber = 1;
+                    break;
+                case 55:
+                    OffsetNumber = 2;
+                    break;
+                case 56:
+                    OffsetNumber = 3;
+                    break;
+                case 57:
+                    OffsetNumber = 4;
+                    break;
+                case 58:
+                    OffsetNumber = 5;
+                    break;
+                case 59:
+                    OffsetNumber = 6;
+                    break;
+                default:
+                    OffsetNumber = WCSOffsetValue;
+                    break;
+            }
+        }
+        return OffsetNumber;
+    }
+
+    public void GenerateDoubleWall(int PCom, ICLDExtCycleCommand cmd)
+    {
+        var CountStep1 = cmd.Prm.Int[-63];
+        var CountStep2 = cmd.Prm.Int[-64];
+        if (CountStep1 > 2 || CountStep2 > 2)
+        {
+            Log.Error("Measure count is not available for this machining center");
+        }
+        else
+        {
+            var ax1 = "";
+            var ax2 = "";
+            var IncDistanceName1 = "";
+            var IncDistanceName2 = "";
+            var AxParamInd1 = 0;
+            var AxParamInd2 = 0;
+            if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+            {
+                ax1 = "X";
+                AxParamInd1 = -100;
+                IncDistanceName1 = "I";
+            }
+            else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
+            {
+                ax1 = "Y";
+                AxParamInd1 = -101;
+                IncDistanceName1 = "J";
+            }
+            if (IsEqD(Abs(cmd.Prm.Flt[-103 - (CountStep1 * 6)]), 1, Zero))
+            {
+                ax2 = "X";
+                AxParamInd2 = -100 - (CountStep1 * 6);
+                IncDistanceName2 = "I";
+            }
+            else if (IsEqD(Abs(cmd.Prm.Flt[-104 - (CountStep1 * 6)]), 1, Zero))
+            {
+                ax2 = "Y";
+                AxParamInd2 = -101 - (CountStep1 * 6);
+                IncDistanceName2 = "J";
+            }
+            if (ax1 == "" || ax2 == "" || ax1 == ax2)
+            {
+                Log.Error("Target vector is not in standard direction");
+            }
+            else
+            {
+                var OffsetNumber = GetWorkOffsetNumber(cmd);
+                if (OffsetNumber != -1)
+                {
+                    if (CountStep1 == 2 && CountStep2 == 2)
+                    {
+                        OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
+                                       (IncDistanceName1, cmd.Prm.Flt[-56]), (IncDistanceName2, cmd.Prm.Flt[-57]),
+                                       ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
+                    }
+                    else if (CountStep1 < 2 && CountStep2 == 2)
+                    {
+                        OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
+                                       (IncDistanceName2, cmd.Prm.Flt[-57]), ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
+                    }
+                    else if (CountStep1 == 2 && CountStep2 < 2)
+                    {
+                        OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
+                                       (IncDistanceName1, cmd.Prm.Flt[-56]), ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
+                    }
+                    else
+                    {
+                        OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
+                                       ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
+                    }
+                }
+                else
+                {
+                    Log.Error("Current WCS offset mode is not available for this machining center");
+                }
+            }
+        }
+    }
+
+    public override void OnProbeExtCycle(ICLDExtCycleCommand cmd, CLDArray cld)
+    {
+        //G65 P9819 C200. D25. K–10. B4. A45. 
+        if (!cmd.IsCall)
+            return;
+        switch (cmd.Prm.Int[-2])
+        {
+            case -500: // Probe On/Off
+                if (cmd.Prm.Bol[-3])
+                { // Probe On
+                    OutG65_P(9832, "Probe ON");
+                }
+                else
+                { // Probe Off
+                    OutG65_P(9833, "Probe OFF");
+                }
+                break;
+            case 10: //Hole P9814 (recrod)
+                OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]),
+                    ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
+                break;
+            case 11: //Boss P9814 (recrod)
+                OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("Z", cmd.Prm.Flt[-51]), ("R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]),
+                                ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
+                break;
+            case 12: //Hole Protected P9814 (recrod)
+                OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("Z", cmd.Prm.Flt[-51]), ("-R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]),
+                                ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
+                break;
+            case 13: //Single Surface P9811 (recrod)
                 if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
                 {
-                    ax1 = "X";
-                    AxParamInd1 = -100;
-                    IncDistanceName1 = "I";
+                    OutG65_P(9811, ("X", cmd.Prm.Flt[-100]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]),
+                                   ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
                 }
                 else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
                 {
-                    ax1 = "Y";
-                    AxParamInd1 = -101;
-                    IncDistanceName1 = "J";
-                }  
-                if (IsEqD(Abs(cmd.Prm.Flt[-103-(CountStep1*6)]), 1, Zero))
-                {
-                    ax2 = "X";
-                    AxParamInd2 = -100-(CountStep1*6);
-                    IncDistanceName2 = "I";
+                    OutG65_P(9811, ("Y", cmd.Prm.Flt[-101]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]),
+                                   ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
                 }
-                else if (IsEqD(Abs(cmd.Prm.Flt[-104-(CountStep1*6)]), 1, Zero))
+                else if (IsEqD(Abs(cmd.Prm.Flt[-105]), 1, Zero))
                 {
-                    ax2 = "Y";
-                    AxParamInd2 = -101-(CountStep1*6);
-                    IncDistanceName2 = "J";
-                } 
-                if (ax1=="" || ax2=="" || ax1==ax2)
-                {
-                    Log.Error("Target vector is not in standard direction");  
-                }  
+                    OutG65_P(9811, ("Z", cmd.Prm.Flt[-102]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]),
+                                   ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
+                }
                 else
                 {
-                    var OffsetNumber = GetWorkOffsetNumber(cmd);
-                    if (OffsetNumber!=-1)
-                    {
-                        if (CountStep1 == 2 && CountStep2 == 2)
-                        {
-                            OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
-                                           (IncDistanceName1, cmd.Prm.Flt[-56]), (IncDistanceName2, cmd.Prm.Flt[-57]),
-                                           ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
-                        }
-                        else if (CountStep1 < 2 && CountStep2 == 2)
-                        {
-                            OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
-                                           (IncDistanceName2, cmd.Prm.Flt[-57]), ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));   
-                        }
-                        else if (CountStep1 == 2 && CountStep2 < 2)
-                        {
-                            OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
-                                           (IncDistanceName1, cmd.Prm.Flt[-56]), ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));   
-                        }
-                        else
-                        {
-                            OutG65_P(PCom, (ax1, cmd.Prm.Flt[AxParamInd1]), (ax2, cmd.Prm.Flt[AxParamInd2]), ("B", cmd.Prm.Flt[12]),
-                                           ("M", cmd.Prm.Flt[11]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));     
-                        }
-                    }
-                    else
-                    {
-                        Log.Error("Current WCS offset mode is not available for this machining center"); 
-                    }
+                    Log.Error("Target vector is not in standard direction");
                 }
-            }
-        }
-
-        public override void OnProbeExtCycle(ICLDExtCycleCommand cmd, CLDArray cld)
-        {
-            //G65 P9819 C200. D25. K–10. B4. A45. 
-            if (!cmd.IsCall)
-                return;
-            switch (cmd.Prm.Int[-2])
-            {
-                case -500: // Probe On/Off
-                    if (cmd.Prm.Bol[-3]) { // Probe On
-                        OutG65_P(9832, "Probe ON");
-                    } else { // Probe Off
-                        OutG65_P(9833, "Probe OFF");
-                    }
-                    break;
-                case 10: //Hole P9814 (recrod)
-                    OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), 
-                        ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
-                    break;
-                case 11: //Boss P9814 (recrod)
-                    OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("Z", cmd.Prm.Flt[-51]), ("R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]), 
-                                    ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
-                    break;
-                case 12: //Hole Protected P9814 (recrod)
-                    OutG65_P(9814, ("D", cmd.Prm.Flt[-52]), ("Z", cmd.Prm.Flt[-51]), ("-R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]), 
-                                    ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
-                    break;
-                case 13: //Single Surface P9811 (recrod)
-                    if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+                break;
+            case 14: //Web P9812 (WCS offset)
+                var ax = "";
+                var AxParamInd = 0;
+                if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+                {
+                    ax = "X";
+                    AxParamInd = -100;
+                }
+                else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
+                {
+                    ax = "Y";
+                    AxParamInd = -101;
+                }
+                if (ax != "")
+                {
+                    var OffsetNumber = GetWorkOffsetNumber(cmd);
+                    if (OffsetNumber != -1)
                     {
-                        OutG65_P(9811, ("X", cmd.Prm.Flt[-100]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]), 
-                                       ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
-                    }
-                    else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
-                    {
-                        OutG65_P(9811, ("Y", cmd.Prm.Flt[-101]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]), 
-                                       ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
-                    }
-                    else if (IsEqD(Abs(cmd.Prm.Flt[-105]), 1, Zero))
-                    {
-                        OutG65_P(9811, ("Z", cmd.Prm.Flt[-102]), ("H", cmd.Prm.Flt[11]), ("M", cmd.Prm.Flt[12]), 
-                                       ("Q", cmd.Prm.Flt[10]), ("W", probingCycle.CalcW(cmd.Prm.Int[-24], cmd.Prm.Int[-25])));
+                        OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("Z", cmd.Prm.Flt[-51]), ("R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]),
+                                ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
                     }
                     else
                     {
-                        Log.Error("Target vector is not in standard direction");
+                        Log.Error("Current WCS offset mode is not available for this machining center");
                     }
-                    break;
-                case 14: //Web P9812 (WCS offset)
-                    var ax = "";
-                    var AxParamInd = 0;
-                    if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+
+                }
+                else
+                {
+                    Log.Error("Target vector is not in standard direction");
+                }
+
+                break;
+            case 15: //Pocket P9812 (WCS offset)
+                ax = "";
+                AxParamInd = 0;
+                if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+                {
+                    ax = "X";
+                    AxParamInd = -100;
+                }
+                else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
+                {
+                    ax = "Y";
+                    AxParamInd = -101;
+                }
+                if (ax != "")
+                {
+                    var OffsetNumber = GetWorkOffsetNumber(cmd);
+                    if (OffsetNumber != -1)
                     {
-                        ax = "X";
-                        AxParamInd = -100;
-                    }
-                    else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
-                    {
-                        ax = "Y";
-                        AxParamInd = -101;
-                    }
-                    if (ax!="")
-                    {
-                        var OffsetNumber = GetWorkOffsetNumber(cmd);
-                        if (OffsetNumber!=-1)
-                        {
-                            OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("Z", cmd.Prm.Flt[-51]), ("R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]), 
-                                    ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
-                        }
-                        else
-                        {
-                            Log.Error("Current WCS offset mode is not available for this machining center"); 
-                        }
- 
+                        OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("H", cmd.Prm.Flt[11]),
+                                ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
                     }
                     else
                     {
-                        Log.Error("Target vector is not in standard direction");    
+                        Log.Error("Current WCS offset mode is not available for this machining center");
                     }
 
-                    break;
-                case 15: //Pocket P9812 (WCS offset)
-                    ax = "";
-                    AxParamInd = 0;
-                    if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+                }
+                else
+                {
+                    Log.Error("Target vector is not in standard direction");
+                }
+
+                break;
+            case 16: //PocketProtected P9812 (WCS offset)
+                ax = "";
+                AxParamInd = 0;
+                if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
+                {
+                    ax = "X";
+                    AxParamInd = -100;
+                }
+                else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
+                {
+                    ax = "Y";
+                    AxParamInd = -101;
+                }
+                if (ax != "")
+                {
+                    var OffsetNumber = GetWorkOffsetNumber(cmd);
+                    if (OffsetNumber != -1)
                     {
-                        ax = "X";
-                        AxParamInd = -100;
-                    }
-                    else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
-                    {
-                        ax = "Y";
-                        AxParamInd = -101;
-                    }
-                    if (ax!="")
-                    {
-                        var OffsetNumber = GetWorkOffsetNumber(cmd);
-                        if (OffsetNumber!=-1)
-                        {
-                            OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("H", cmd.Prm.Flt[11]), 
-                                    ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
-                        }
-                        else
-                        {
-                            Log.Error("Current WCS offset mode is not available for this machining center"); 
-                        }
- 
+                        OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("Z", cmd.Prm.Flt[-51]), ("-R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]),
+                                ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
                     }
                     else
                     {
-                        Log.Error("Target vector is not in standard direction");    
+                        Log.Error("Current WCS offset mode is not available for this machining center");
                     }
 
-                    break;
-                case 16: //PocketProtected P9812 (WCS offset)
-                    ax = "";
-                    AxParamInd = 0;
-                    if (IsEqD(Abs(cmd.Prm.Flt[-103]), 1, Zero))
-                    {
-                        ax = "X";
-                        AxParamInd = -100;
-                    }
-                    else if (IsEqD(Abs(cmd.Prm.Flt[-104]), 1, Zero))
-                    {
-                        ax = "Y";
-                        AxParamInd = -101;
-                    }
-                    if (ax!="")
-                    {
-                        var OffsetNumber = GetWorkOffsetNumber(cmd);
-                        if (OffsetNumber!=-1)
-                        {
-                            OutG65_P(9812, (ax, cmd.Prm.Flt[AxParamInd]), ("Z", cmd.Prm.Flt[-51]), ("-R", cmd.Prm.Flt[-56]), ("H", cmd.Prm.Flt[11]), 
-                                    ("M", cmd.Prm.Flt[12]), ("Q", cmd.Prm.Flt[10]), ("S", OffsetNumber));
-                        }
-                        else
-                        {
-                            Log.Error("Current WCS offset mode is not available for this machining center"); 
-                        }
- 
-                    }
-                    else
-                    {
-                        Log.Error("Target vector is not in standard direction");    
-                    }
+                }
+                else
+                {
+                    Log.Error("Target vector is not in standard direction");
+                }
 
-                    break;
-                case 17: //Internal Corner P9815 (WCS offset)
-                    GenerateDoubleWall(9815, cmd);
-                    break;
-                case 18: //External Corner P9816 (WCS offset)
-                    GenerateDoubleWall(9816, cmd);
-                    break;
-                case 100: //Z calibration P9801 (tool probing)
-                    OutG65_P(9801, ("Z", cmd.Prm.Flt[-102]), ("T", cmd.Prm.Int[-12]));
-                    break;
-                case 101: //X,Y calibration P9802 (tool probing)
-                    OutG65_P(9802, ("D", cmd.Prm.Flt[-52]));
-                    break;
-                case 102: //Radius calibration P9804 (tool probing)
-                    OutG65_P(9804, ("D", cmd.Prm.Flt[-52]));
-                    break;
-            }
-            
-        }
-
-        public override void OnStop(ICLDStopCommand cmd, CLDArray cld)
-        {
-            nc.Block.Out();
-            nc.M.Show(0);
-            nc.Block.Out();
-        }
-
-        public override void OnOpStop(ICLDOpStopCommand cmd, CLDArray cld)
-        {
-            nc.Block.Out();
-            nc.M.Show(1);
-            nc.Block.Out();
-        }
-
-        public override void OnDelay(ICLDDelayCommand cmd, CLDArray cld)
-        {
-            nc.GDelay.Show(4);
-            nc.XDelay.Show(cmd.TimeSpan);
-            nc.Block.Out();
-        }
-
-        public override void OnBeforeCommandHandle(ICLDCommand cmd, CLDArray cld)
-        {
-            
-        }
-
-        
-        public override void StopOnCLData() 
-        {
-            // Do nothing, just to be possible to use CLData breakpoints
+                break;
+            case 17: //Internal Corner P9815 (WCS offset)
+                GenerateDoubleWall(9815, cmd);
+                break;
+            case 18: //External Corner P9816 (WCS offset)
+                GenerateDoubleWall(9816, cmd);
+                break;
+            case 100: //Z calibration P9801 (tool probing)
+                OutG65_P(9801, ("Z", cmd.Prm.Flt[-102]), ("T", cmd.Prm.Int[-12]));
+                break;
+            case 101: //X,Y calibration P9802 (tool probing)
+                OutG65_P(9802, ("D", cmd.Prm.Flt[-52]));
+                break;
+            case 102: //Radius calibration P9804 (tool probing)
+                OutG65_P(9804, ("D", cmd.Prm.Flt[-52]));
+                break;
         }
 
     }
+
+    public override void OnStop(ICLDStopCommand cmd, CLDArray cld)
+    {
+        nc.Block.Out();
+        nc.M.Show(0);
+        nc.Block.Out();
+    }
+
+    public override void OnOpStop(ICLDOpStopCommand cmd, CLDArray cld)
+    {
+        nc.Block.Out();
+        nc.M.Show(1);
+        nc.Block.Out();
+    }
+
+    public override void OnDelay(ICLDDelayCommand cmd, CLDArray cld)
+    {
+        nc.GDelay.Show(4);
+        nc.XDelay.Show(cmd.TimeSpan);
+        nc.Block.Out();
+    }
+
+    public override void OnBeforeCommandHandle(ICLDCommand cmd, CLDArray cld)
+    {
+
+    }
+
+
+    public override void StopOnCLData()
+    {
+        // Do nothing, just to be possible to use CLData breakpoints
+    }
+
 }

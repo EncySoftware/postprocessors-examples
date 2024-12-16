@@ -28,7 +28,7 @@
             "program": "${env:InpCoreDir}/InpCore.exe",
             "args": [
                 "-batchmode", 
-                "-cldfile:\"C:\\Users\\Public\\Documents\\ENCY\\Version 1\\Projects\\Examples\\Milling\\3+2D\\3+2.stcp\"",
+                "-cldfile:\"$(PROGRAM_COMMON_DOCUMENTS)\\Projects\\Examples\\Milling\\3+2D\\3+2.stcp\"",
                 "-postfile:\"${workspaceFolder}\\bin\\Debug\\${workspaceFolderBasename}.dll\"",
                 "-settingsfile:\"${workspaceFolder}\\Settings.xml"
                 ],
